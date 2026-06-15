@@ -15,14 +15,26 @@ key, no payment) to find professors beyond the seeded database.
 
 ## Features
 
-- **📋 Professor Profiles** — expandable cards with metrics, cited works, links
+- **📋 Professor Profiles** — expandable cards with metrics, cited works, links, and a
+  **"Show top co-authors" button** that pulls each professor's frequent collaborators
+  live from OpenAlex
 - **🔎 Find New Professors** — **free** live search via OpenAlex (240M+ scholarly
   works); returns real citation counts, h-index, institutions, and most-cited works.
+  **Searching by professor name also displays their top co-authors automatically.**
   Found professors merge into every tab and the downloads.
 - **📊 Analytics** — Impact vs Social scatter, top-15 rankings, area distribution
   (search-found professors highlighted in green)
 - **📄 Top Cited Works** — searchable table of notable works
 - **📥 Download Data** — export everything (seed + found) as CSV or JSON
+
+## Co-authors (via OpenAlex)
+
+For any professor — seeded or found via search — the app can show their **top
+co-authors**, ranked by number of joint works (ties broken by joint citation count).
+It works by resolving the professor to their OpenAlex profile, pulling up to 200 of
+their most-cited works, and aggregating co-authorships across them. Each co-author
+row shows their institution, joint-work count, joint citations, and a link to their
+OpenAlex profile, plus a bar chart of the top 10 collaborators.
 
 ## Run locally
 

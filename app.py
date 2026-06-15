@@ -29,6 +29,9 @@ seed_profs = load_data()
 if "extra_profs" not in st.session_state:
     st.session_state.extra_profs = []
 
+if "coauthors_show" not in st.session_state:
+    st.session_state.coauthors_show = set()
+
 profs = seed_profs + st.session_state.extra_profs
 df = pd.DataFrame(profs)
 
@@ -189,6 +192,110 @@ def run_search(mode, query, n, mailto):
     except Exception as e:
         return [], f"Search error: {e}"
 
+# ── Co-author functions (OpenAlex) ──
+@st.cache_data(ttl=3600, show_spinner=False)
+def resolve_author_id(name, mailto=None):
+    """Resolve a professor name to their best-match OpenAlex author URL.
+    Returns (author_url, display_name, institution) or (None, None, None)."""
+    try:
+        r = requests.get(f"{OPENALEX_BASE}/authors",
+                         params=_params({"search": name, "per-page": 1}, mailto), timeout=20)
+        r.raise_for_status()
+        results = r.json().get("results", [])
+        if not results:
+            return None, None, None
+        a = results[0]
+        inst = ""
+        lki = a.get("last_known_institutions") or []
+        if not lki and a.get("last_known_institution"):
+            lki = [a["last_known_institution"]]
+        if lki and isinstance(lki[0], dict):
+            inst = lki[0].get("display_name", "") or ""
+        return a.get("id"), a.get("display_name"), inst
+    except Exception:
+        return None, None, None
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_coauthors(author_url, mailto=None, top_n=15, max_works=200):
+    """Aggregate an author's frequent co-authors from their works on OpenAlex.
+    Returns (list_of_coauthor_dicts, n_works_scanned, error)."""
+    if not author_url:
+        return [], 0, "No OpenAlex author id."
+    aid = author_url.split("/")[-1]
+    try:
+        r = requests.get(f"{OPENALEX_BASE}/works",
+                         params=_params({"filter": f"author.id:{aid}",
+                                         "sort": "cited_by_count:desc",
+                                         "per-page": min(max_works, 200),
+                                         "select": "id,display_name,publication_year,cited_by_count,authorships"},
+                                        mailto), timeout=30)
+        r.raise_for_status()
+        works = r.json().get("results", [])
+        counts, info, cocites = {}, {}, {}
+        for w in works:
+            wc = w.get("cited_by_count", 0) or 0
+            for au in w.get("authorships", []):
+                aobj = au.get("author", {}) or {}
+                cid = aobj.get("id")
+                if not cid or cid == author_url:
+                    continue
+                counts[cid] = counts.get(cid, 0) + 1
+                cocites[cid] = cocites.get(cid, 0) + wc
+                if cid not in info:
+                    insts = au.get("institutions", []) or []
+                    iname = insts[0].get("display_name", "") if insts and isinstance(insts[0], dict) else ""
+                    info[cid] = {"name": aobj.get("display_name", ""), "institution": iname}
+        ranked = sorted(counts.items(), key=lambda x: (x[1], cocites.get(x[0], 0)), reverse=True)[:top_n]
+        coauthors = [{
+            "name": info[cid]["name"],
+            "institution": info[cid]["institution"],
+            "joint_works": cnt,
+            "joint_citations": cocites.get(cid, 0),
+            "openalex": cid,
+        } for cid, cnt in ranked]
+        return coauthors, len(works), None
+    except requests.exceptions.RequestException as e:
+        return [], 0, f"Network error: {e}"
+    except Exception as e:
+        return [], 0, f"Error: {e}"
+
+def render_coauthors(p, mailto, key_prefix=""):
+    """Resolve an author (seeded or OpenAlex) and render their top co-authors as a table + chart."""
+    name = p.get("name", "")
+    author_url = p.get("website") if p.get("_source") == "openalex" else None
+    with st.spinner(f"Fetching co-authors for {name} from OpenAlex…"):
+        resolved_inst = None
+        if not author_url:
+            author_url, _rn, resolved_inst = resolve_author_id(name, mailto)
+        if not author_url:
+            st.info(f"No OpenAlex profile found for **{name}**, so co-authors aren't available.")
+            return
+        coauthors, nworks, err = fetch_coauthors(author_url, mailto)
+    if err:
+        st.warning(f"Couldn't load co-authors: {err}")
+        return
+    if not coauthors:
+        st.info("No co-authors found on OpenAlex for this author.")
+        return
+    if resolved_inst:
+        st.caption(f"Matched OpenAlex profile: {name} — {resolved_inst}")
+    st.markdown(f"**🔗 Top {len(coauthors)} co-authors** (aggregated from {nworks} most-cited works on OpenAlex):")
+    ca_df = pd.DataFrame([{
+        "Co-author": c["name"],
+        "Institution": c["institution"] or "—",
+        "Joint works": c["joint_works"],
+        "Joint citations": c["joint_citations"],
+        "OpenAlex": c["openalex"],
+    } for c in coauthors])
+    st.dataframe(ca_df, use_container_width=True, hide_index=True,
+                 column_config={"OpenAlex": st.column_config.LinkColumn("OpenAlex", display_text="profile ↗")})
+    chart_df = ca_df.head(10).sort_values("Joint works")
+    fig = px.bar(chart_df, x="Joint works", y="Co-author", orientation="h",
+                 template="plotly_dark", color="Joint works", color_continuous_scale="Tealgrn",
+                 labels={"Joint works": "Number of joint works"})
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10), coloraxis_showscale=False)
+    st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_coauth_chart_{author_url}")
+
 # ═══════════════════════════════════════
 # HEADER
 # ═══════════════════════════════════════
@@ -318,6 +425,20 @@ def render_professor(p, found=False):
         if links:
             st.markdown(" | ".join(links))
 
+        # Co-author lookup (live from OpenAlex)
+        st.markdown("---")
+        ckey = p.get("website") or p.get("name", "")
+        mailto_local = st.session_state.get("openalex_mailto", "") or None
+        if ckey in st.session_state.coauthors_show:
+            render_coauthors(p, mailto_local, key_prefix="card")
+            if st.button("Hide co-authors", key=f"hide_coauth_{ckey}"):
+                st.session_state.coauthors_show.discard(ckey)
+                st.rerun()
+        else:
+            if st.button("🔗 Show top co-authors (OpenAlex)", key=f"show_coauth_{ckey}"):
+                st.session_state.coauthors_show.add(ckey)
+                st.rerun()
+
 # ── TAB 1 ──
 with tab1:
     if not filtered:
@@ -330,7 +451,7 @@ with tab2:
     st.subheader("🔎 Find Professors Beyond the Database — Free, No API Key")
     st.markdown("Searches **OpenAlex**, an open catalog of 240M+ scholarly works. Returns real citation "
                 "counts, h-index, institutions, and most-cited works. Found professors are added to every "
-                "tab for this session.")
+                "tab for this session. **Searching by professor name also shows their top co-authors.**")
     st.info("ℹ️ OpenAlex provides academic metrics only. **Social activeness scores aren't available** "
             "from free data, so searched professors show *Social: N/A*. Impact, h-index, citations and "
             "works are all real.")
@@ -400,6 +521,18 @@ with tab2:
                         st.metric("h-index", r.get("h_index", "?"))
                         st.metric("Citations", f"{r.get('citations',0):,}")
                         st.caption("Social: N/A")
+                    # Co-authors: shown automatically for name searches, on-demand for field searches
+                    mailto_res = st.session_state.get("openalex_mailto", "") or None
+                    if active_mode == "Professor name":
+                        with st.expander(f"🔗 Top co-authors of {r.get('name','')}", expanded=True):
+                            render_coauthors(r, mailto_res, key_prefix=f"search{idx}")
+                    else:
+                        rk = r.get("website") or r.get("name", "")
+                        if rk in st.session_state.coauthors_show:
+                            render_coauthors(r, mailto_res, key_prefix=f"search{idx}")
+                        elif st.button(f"🔗 Show co-authors of {r.get('name','')}", key=f"sc_show_{idx}_{rk}"):
+                            st.session_state.coauthors_show.add(rk)
+                            st.rerun()
                     if st.button(f"➕ Add {r.get('name','')}", key=f"add_{idx}_{r.get('name','')}"):
                         st.session_state.extra_profs.append(r)
                         st.success(f"Added {r.get('name','')}!")
