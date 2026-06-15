@@ -1,8 +1,8 @@
 # 🤖 AI & Future of Work — Professor Directory
 
 A hostable Streamlit web app to explore Economics & Finance professors researching
-AI, automation, FinTech, and the future of work — now with **AI-powered live search**
-to find professors beyond the seeded database.
+AI, automation, FinTech, and the future of work — with **free live search** (no API
+key, no payment) to find professors beyond the seeded database.
 
 ## What's included
 
@@ -12,15 +12,15 @@ to find professors beyond the seeded database.
 | `professors_data.json` | Seed database of 76 professors |
 | `requirements.txt` | Python dependencies |
 | `AI_Future_of_Work_Professors.xlsx` | Excel workbook of the seed database |
-| `secrets.toml.example` | Template for the API key when hosting |
 
 ## Features
 
 - **📋 Professor Profiles** — expandable cards with metrics, cited works, links
-- **🔎 Find New Professors** — live web search (via Claude) for professors *not* in the
-  database; found professors merge into every tab and the downloads
+- **🔎 Find New Professors** — **free** live search via OpenAlex (240M+ scholarly
+  works); returns real citation counts, h-index, institutions, and most-cited works.
+  Found professors merge into every tab and the downloads.
 - **📊 Analytics** — Impact vs Social scatter, top-15 rankings, area distribution
-  (search-found professors are highlighted in green)
+  (search-found professors highlighted in green)
 - **📄 Top Cited Works** — searchable table of notable works
 - **📥 Download Data** — export everything (seed + found) as CSV or JSON
 
@@ -31,32 +31,40 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Enable AI live search
+## Live search — completely free
 
-The "Find New Professors" tab needs an Anthropic API key (get one at
-[console.anthropic.com](https://console.anthropic.com)).
+The "Find New Professors" tab uses **OpenAlex**, a free and open scholarly database.
+**No API key, no account, no funds required.** Search by research field/topic or by
+professor name. Optionally enter your email in the sidebar to use OpenAlex's faster
+"polite pool" (still free).
 
-**Option A — quick (per session):** paste the key into the sidebar under *AI Search Setup*.
+### Honest limitation
 
-**Option B — for hosting:** create `.streamlit/secrets.toml`:
+OpenAlex provides academic data (citations, h-index, works, institutions) but **not**
+LinkedIn/Twitter activity. So professors found via search show **Social: N/A**. Their
+impact score is derived from h-index using this transparent mapping:
 
-```toml
-ANTHROPIC_API_KEY = "sk-ant-..."
-```
-
-(See `secrets.toml.example`.)
+| h-index | Impact score |
+|---------|--------------|
+| ≥150 | 99 |
+| ≥100 | 95 |
+| ≥70 | 90 |
+| ≥50 | 85 |
+| ≥35 | 80 |
+| ≥25 | 75 |
+| ≥15 | 68 |
+| ≥8 | 60 |
+| <8 | 50 |
 
 ## Deploy free on Streamlit Community Cloud
 
 1. Push these files to a GitHub repo.
 2. Go to [share.streamlit.io](https://share.streamlit.io) and connect the repo.
-3. In the app's **Settings → Secrets**, paste your `ANTHROPIC_API_KEY`.
-4. Deploy. Done!
+3. Deploy. **No secrets or API keys needed.**
 
 ## Notes
 
-- Professors found via live search persist for the browser session. Use the
-  download buttons to save an enriched database, or "Clear all found professors"
-  to reset.
-- The app never hard-codes your API key; it is read from the sidebar input or
-  Streamlit secrets only.
+- Professors found via live search persist for the browser session. Use the download
+  buttons to save an enriched database, or "Clear all found professors" to reset.
+- Verify anything decision-critical against the professor's actual profile and Google
+  Scholar — derived impact scores are approximate.
