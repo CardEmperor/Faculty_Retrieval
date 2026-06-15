@@ -2,7 +2,11 @@ import streamlit as st
 import pandas as pd
 import json
 import os
+import time
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import plotly.express as px
 
 # ═══════════════════════════════════════
@@ -49,9 +53,36 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ═══════════════════════════════════════
-# OPENALEX SEARCH  (free, no API key)
+# OPENALEX — resilient network layer
 # ═══════════════════════════════════════
 OPENALEX_BASE = "https://api.openalex.org"
+
+# ── One shared session: connection-pooled + automatic retries with backoff ──
+#   3 retries, starting at 1 s and doubling: 1 s → 2 s → 4 s.
+#   Only retried for transient errors (408, 429, 500, 502, 503, 504).
+#   Per-request read timeout is kept short (8 s) so a stall fails fast
+#   and the adapter retries, rather than blocking the UI for 25+ seconds.
+def _make_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=1,          # wait 1 s, 2 s, 4 s between attempts
+        status_forcelist={408, 429, 500, 502, 503, 504},
+        allowed_methods={"GET"},
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=10)
+    session.mount("https://", adapter)
+    session.mount("http://",  adapter)
+    return session
+
+# Module-level singleton — reused across Streamlit reruns via the module cache.
+_SESSION = _make_session()
+
+# Short individual timeout: (connect_timeout, read_timeout).
+# The adapter will retry up to 3× if this fires, total worst-case ≈ 8+16+32 = 56 s,
+# but typical success on retry-2 is well under 20 s.
+_TIMEOUT = (5, 8)
 
 COUNTRY_NAMES = {
     "US":"United States","GB":"United Kingdom","CA":"Canada","DE":"Germany","FR":"France",
@@ -62,239 +93,319 @@ COUNTRY_NAMES = {
 }
 
 def _country_name(code):
-    if not code:
-        return ""
-    return COUNTRY_NAMES.get(code.upper(), code.upper())
+    return COUNTRY_NAMES.get((code or "").upper(), (code or "").upper())
 
 def _impact_from_hindex(h):
-    """Derive a 0-100 impact score from h-index (documented, transparent mapping)."""
     for t, s in [(150,99),(100,95),(70,90),(50,85),(35,80),(25,75),(15,68),(8,60)]:
         if h >= t:
             return s
     return 50
 
-def _author_core(a):
-    """Pure mapping of an OpenAlex author object into our schema (no network)."""
-    inst, country = "", ""
-    lki = a.get("last_known_institutions") or []
-    if not lki and a.get("last_known_institution"):
-        lki = [a["last_known_institution"]]
-    if lki and isinstance(lki[0], dict):
-        inst = lki[0].get("display_name", "") or ""
-        country = _country_name(lki[0].get("country_code", "") or "")
-    areas = []
-    for c in (a.get("x_concepts") or []):
-        if (c.get("score") or 0) >= 20 and c.get("display_name"):
-            areas.append(c["display_name"])
-    areas = areas[:6] or ["(see OpenAlex profile)"]
-    stats = a.get("summary_stats") or {}
-    h = int(stats.get("h_index") or 0)
-    cites = int(a.get("cited_by_count") or 0)
-    orcid = (a.get("ids") or {}).get("orcid", "") or ""
-    return {
-        "name": a.get("display_name", "Unknown"),
-        "university": inst,
-        "department": "",
-        "title": "Researcher (via OpenAlex)",
-        "country": country,
-        "areas": areas,
-        "h_index": h,
-        "citations": cites,
-        "impact_score": _impact_from_hindex(h),
-        "social_score": None,           # not available from a free academic source
-        "top_cited": [],
-        "linkedin": "",
-        "twitter": "",
-        "website": a.get("id", ""),     # OpenAlex profile URL
-        "scholar": orcid,
-        "email": "",
-        "ra_hiring": None,
-        "phd_students": "",
-        "seeks": "",
-        "awards": "",
-        "works_count": a.get("works_count", 0),
-        "_source": "openalex",
-    }
-
-def _params(extra, mailto):
+def _params(extra: dict, mailto: str | None) -> dict:
     p = dict(extra)
     if mailto:
         p["mailto"] = mailto
     return p
 
-def fetch_top_works(author_id, mailto=None, n=3):
+def _get(url, params, label="OpenAlex"):
+    """Thin GET wrapper that converts network errors to a clear message."""
     try:
-        r = requests.get(f"{OPENALEX_BASE}/works",
-                         params=_params({"filter": f"author.id:{author_id}",
-                                         "sort": "cited_by_count:desc", "per-page": n}, mailto),
-                         timeout=20)
+        r = _SESSION.get(url, params=params, timeout=_TIMEOUT)
         r.raise_for_status()
-        works = []
-        for w in r.json().get("results", []):
-            title = w.get("display_name") or "Untitled"
-            year = w.get("publication_year")
-            cites = w.get("cited_by_count", 0) or 0
-            label = title
-            if year:
-                label += f" ({year})"
-            label += f" — {cites:,} citations"
-            works.append(label)
-        return works
-    except Exception:
-        return []
+        return r.json(), None
+    except requests.exceptions.Timeout:
+        return None, f"{label}: timed out after 3 retries — OpenAlex may be slow right now. Try again in a moment."
+    except requests.exceptions.ConnectionError as e:
+        return None, f"{label}: connection error — {e}"
+    except requests.exceptions.HTTPError as e:
+        return None, f"{label}: HTTP {e.response.status_code}"
+    except Exception as e:
+        return None, f"{label}: {e}"
 
-def author_to_prof(a, mailto=None):
+# ── Schema helpers ──
+def _author_core(a: dict) -> dict:
+    inst, country = "", ""
+    lki = a.get("last_known_institutions") or []
+    if not lki and a.get("last_known_institution"):
+        lki = [a["last_known_institution"]]
+    if lki and isinstance(lki[0], dict):
+        inst    = lki[0].get("display_name", "") or ""
+        country = _country_name(lki[0].get("country_code", "") or "")
+    areas = [c["display_name"] for c in (a.get("x_concepts") or [])
+             if (c.get("score") or 0) >= 20 and c.get("display_name")][:6]
+    areas = areas or ["(see OpenAlex profile)"]
+    stats = a.get("summary_stats") or {}
+    h     = int(stats.get("h_index") or 0)
+    cites = int(a.get("cited_by_count") or 0)
+    orcid = (a.get("ids") or {}).get("orcid", "") or ""
+    return {
+        "name":         a.get("display_name", "Unknown"),
+        "university":   inst,
+        "department":   "",
+        "title":        "Researcher (via OpenAlex)",
+        "country":      country,
+        "areas":        areas,
+        "h_index":      h,
+        "citations":    cites,
+        "impact_score": _impact_from_hindex(h),
+        "social_score": None,
+        "top_cited":    [],
+        "linkedin":     "",
+        "twitter":      "",
+        "website":      a.get("id", ""),   # OpenAlex canonical URL
+        "scholar":      orcid,
+        "email":        "",
+        "ra_hiring":    None,
+        "phd_students": "",
+        "seeks":        "",
+        "awards":       "",
+        "works_count":  int(a.get("works_count") or 0),
+        "_source":      "openalex",
+    }
+
+# ── Top-works fetch (lean payload) ──
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_top_works(author_id: str, mailto=None, n=3) -> list[str]:
+    data, err = _get(f"{OPENALEX_BASE}/works",
+                     _params({"filter": f"author.id:{author_id}",
+                              "sort": "cited_by_count:desc",
+                              "per-page": n,
+                              "select": "display_name,publication_year,cited_by_count"},
+                             mailto))
+    if err or not data:
+        return []
+    out = []
+    for w in data.get("results", []):
+        title = w.get("display_name") or "Untitled"
+        year  = w.get("publication_year")
+        cites = w.get("cited_by_count", 0) or 0
+        label = f"{title} ({year})" if year else title
+        out.append(f"{label} — {cites:,} citations")
+    return out
+
+def _author_to_prof(a: dict, mailto=None) -> dict:
     core = _author_core(a)
-    aid = (a.get("id", "") or "").split("/")[-1]
+    aid  = (a.get("id", "") or "").split("/")[-1]
     if aid:
         core["top_cited"] = fetch_top_works(aid, mailto)
     return core
 
-def search_by_name(name, n, mailto):
-    r = requests.get(f"{OPENALEX_BASE}/authors",
-                     params=_params({"search": name, "per-page": n}, mailto), timeout=20)
-    r.raise_for_status()
-    return [author_to_prof(a, mailto) for a in r.json().get("results", [])]
+# ── Author search by name ──
+@st.cache_data(ttl=21600, show_spinner=False)
+def search_by_name(name: str, n: int, mailto=None) -> tuple[list, str | None]:
+    data, err = _get(f"{OPENALEX_BASE}/authors",
+                     _params({"search": name, "per-page": n}, mailto))
+    if err:
+        return [], err
+    authors = data.get("results", []) if data else []
+    # Fetch top works in parallel (one thread per author)
+    results = []
+    with ThreadPoolExecutor(max_workers=min(n, 5)) as ex:
+        futs = {ex.submit(_author_to_prof, a, mailto): a for a in authors}
+        for fut in as_completed(futs):
+            try:
+                results.append(fut.result())
+            except Exception:
+                pass
+    results.sort(key=lambda p: p.get("citations", 0), reverse=True)
+    return results, None
 
-def search_by_field(topic, n, mailto):
-    """Find the most-cited authors writing on a topic, via works aggregation."""
-    r = requests.get(f"{OPENALEX_BASE}/works",
-                     params=_params({"search": topic, "sort": "cited_by_count:desc",
-                                     "per-page": 50}, mailto), timeout=25)
-    r.raise_for_status()
-    seen = {}
-    for w in r.json().get("results", []):
+# ── Author search by field (lean: request only authorships + citations) ──
+@st.cache_data(ttl=21600, show_spinner=False)
+def search_by_field(topic: str, n: int, mailto=None) -> tuple[list, str | None]:
+    data, err = _get(f"{OPENALEX_BASE}/works",
+                     _params({"search": topic,
+                              "sort":   "cited_by_count:desc",
+                              "per-page": 50,
+                              "select": "cited_by_count,authorships"},
+                             mailto))
+    if err:
+        return [], err
+    # Collect unique author IDs in citation-weighted order
+    seen: dict[str, str] = {}  # id → display_name
+    for w in (data or {}).get("results", []):
         for au in w.get("authorships", []):
-            aobj = au.get("author", {}) or {}
-            aid = aobj.get("id")
+            aobj = au.get("author") or {}
+            aid  = aobj.get("id")
             if aid and aid not in seen:
                 seen[aid] = aobj.get("display_name", "")
-        if len(seen) >= n * 3:
-            break
+            if len(seen) >= n * 4:
+                break
+
+    # Fetch full author records in parallel
+    def _fetch_one(aid):
+        d, e = _get(f"{OPENALEX_BASE}/authors/{aid.split('/')[-1]}",
+                    _params({}, mailto), label=f"author {aid[-8:]}")
+        if e or not d:
+            return None
+        return _author_to_prof(d, mailto)
+
     out = []
-    for aid in list(seen.keys())[:n]:
-        try:
-            ar = requests.get(f"{OPENALEX_BASE}/authors/{aid.split('/')[-1]}",
-                              params=_params({}, mailto), timeout=20)
-            if ar.ok:
-                out.append(author_to_prof(ar.json(), mailto))
-        except Exception:
-            continue
-    return out
+    with ThreadPoolExecutor(max_workers=min(n, 5)) as ex:
+        futs = {ex.submit(_fetch_one, aid): aid for aid in list(seen)[:n * 2]}
+        for fut in as_completed(futs):
+            try:
+                p = fut.result()
+                if p:
+                    out.append(p)
+            except Exception:
+                pass
+            if len(out) >= n:
+                break
+
+    out.sort(key=lambda p: p.get("citations", 0), reverse=True)
+    return out[:n], None
 
 def run_search(mode, query, n, mailto):
-    try:
-        if mode == "Research field / topic":
-            return search_by_field(query, n, mailto), None
-        return search_by_name(query, n, mailto), None
-    except requests.exceptions.RequestException as e:
-        return [], f"Network error contacting OpenAlex: {e}"
-    except Exception as e:
-        return [], f"Search error: {e}"
+    if mode == "Research field / topic":
+        return search_by_field(query, n, mailto)
+    return search_by_name(query, n, mailto)
 
-# ── Co-author functions (OpenAlex) ──
-@st.cache_data(ttl=3600, show_spinner=False)
-def resolve_author_id(name, mailto=None):
-    """Resolve a professor name to their best-match OpenAlex author URL.
-    Returns (author_url, display_name, institution) or (None, None, None)."""
-    try:
-        r = requests.get(f"{OPENALEX_BASE}/authors",
-                         params=_params({"search": name, "per-page": 1}, mailto), timeout=20)
-        r.raise_for_status()
-        results = r.json().get("results", [])
-        if not results:
-            return None, None, None
-        a = results[0]
-        inst = ""
-        lki = a.get("last_known_institutions") or []
-        if not lki and a.get("last_known_institution"):
-            lki = [a["last_known_institution"]]
-        if lki and isinstance(lki[0], dict):
-            inst = lki[0].get("display_name", "") or ""
-        return a.get("id"), a.get("display_name"), inst
-    except Exception:
+# ── Co-author resolution & fetch ──
+@st.cache_data(ttl=21600, show_spinner=False)
+def resolve_author_id(name: str, mailto=None) -> tuple[str | None, str | None, str | None]:
+    """Resolve a professor name → (openalex_url, display_name, institution)."""
+    data, err = _get(f"{OPENALEX_BASE}/authors",
+                     _params({"search": name, "per-page": 1,
+                              "select": "id,display_name,last_known_institutions"},
+                             mailto))
+    if err or not data:
         return None, None, None
+    results = data.get("results", [])
+    if not results:
+        return None, None, None
+    a    = results[0]
+    inst = ""
+    lki  = a.get("last_known_institutions") or []
+    if lki and isinstance(lki[0], dict):
+        inst = lki[0].get("display_name", "") or ""
+    return a.get("id"), a.get("display_name"), inst
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_coauthors(author_url, mailto=None, top_n=15, max_works=200):
-    """Aggregate an author's frequent co-authors from their works on OpenAlex.
-    Returns (list_of_coauthor_dicts, n_works_scanned, error)."""
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_coauthors(
+    author_url: str,
+    mailto=None,
+    top_n: int = 15,
+    max_works: int = 100,
+) -> tuple[list, int, str | None]:
+    """
+    Aggregate co-authors from the author's most-cited works.
+
+    Strategy
+    --------
+    • Fetch works in pages of 50 (not one huge 200-row request).
+    • Use select= to pull only the three fields we need, cutting payload ~80 %.
+    • Stop as soon as we have max_works worth of results.
+    • All HTTP calls go through the retry session (_get), so transient 5xx /
+      timeouts are retried automatically with back-off before surfacing an error.
+    """
     if not author_url:
         return [], 0, "No OpenAlex author id."
-    aid = author_url.split("/")[-1]
-    try:
-        r = requests.get(f"{OPENALEX_BASE}/works",
-                         params=_params({"filter": f"author.id:{aid}",
-                                         "sort": "cited_by_count:desc",
-                                         "per-page": min(max_works, 200),
-                                         "select": "id,display_name,publication_year,cited_by_count,authorships"},
-                                        mailto), timeout=30)
-        r.raise_for_status()
-        works = r.json().get("results", [])
-        counts, info, cocites = {}, {}, {}
-        for w in works:
+    aid       = author_url.split("/")[-1]
+    counts: dict[str, int]  = {}
+    cocites: dict[str, int] = {}
+    info:   dict[str, dict] = {}
+    total_fetched = 0
+    PAGE_SIZE = 50
+
+    for page in range(1, (max_works // PAGE_SIZE) + 2):
+        if total_fetched >= max_works:
+            break
+        data, err = _get(
+            f"{OPENALEX_BASE}/works",
+            _params({"filter":   f"author.id:{aid}",
+                     "sort":     "cited_by_count:desc",
+                     "per-page": PAGE_SIZE,
+                     "page":     page,
+                     "select":   "cited_by_count,authorships"},
+                    mailto),
+            label=f"works p{page}",
+        )
+        if err:
+            if total_fetched == 0:
+                return [], 0, err      # nothing yet — propagate the error
+            break                      # got some pages already — use them
+        results = (data or {}).get("results", [])
+        if not results:
+            break
+        for w in results:
             wc = w.get("cited_by_count", 0) or 0
             for au in w.get("authorships", []):
-                aobj = au.get("author", {}) or {}
-                cid = aobj.get("id")
+                aobj = au.get("author") or {}
+                cid  = aobj.get("id")
                 if not cid or cid == author_url:
                     continue
-                counts[cid] = counts.get(cid, 0) + 1
+                counts[cid]  = counts.get(cid, 0) + 1
                 cocites[cid] = cocites.get(cid, 0) + wc
                 if cid not in info:
-                    insts = au.get("institutions", []) or []
-                    iname = insts[0].get("display_name", "") if insts and isinstance(insts[0], dict) else ""
+                    insts = au.get("institutions") or []
+                    iname = (insts[0].get("display_name", "")
+                             if insts and isinstance(insts[0], dict) else "")
                     info[cid] = {"name": aobj.get("display_name", ""), "institution": iname}
-        ranked = sorted(counts.items(), key=lambda x: (x[1], cocites.get(x[0], 0)), reverse=True)[:top_n]
-        coauthors = [{
-            "name": info[cid]["name"],
-            "institution": info[cid]["institution"],
-            "joint_works": cnt,
-            "joint_citations": cocites.get(cid, 0),
-            "openalex": cid,
-        } for cid, cnt in ranked]
-        return coauthors, len(works), None
-    except requests.exceptions.RequestException as e:
-        return [], 0, f"Network error: {e}"
-    except Exception as e:
-        return [], 0, f"Error: {e}"
+        total_fetched += len(results)
+        # If the page was smaller than PAGE_SIZE, there are no more pages
+        if len(results) < PAGE_SIZE:
+            break
+        time.sleep(0.1)  # be a polite client between pages
 
-def render_coauthors(p, mailto, key_prefix=""):
-    """Resolve an author (seeded or OpenAlex) and render their top co-authors as a table + chart."""
-    name = p.get("name", "")
+    ranked = sorted(counts.items(),
+                    key=lambda x: (x[1], cocites.get(x[0], 0)),
+                    reverse=True)[:top_n]
+    coauthors = [{
+        "name":            info[cid]["name"],
+        "institution":     info[cid]["institution"],
+        "joint_works":     cnt,
+        "joint_citations": cocites.get(cid, 0),
+        "openalex":        cid,
+    } for cid, cnt in ranked]
+    return coauthors, total_fetched, None
+
+def render_coauthors(p: dict, mailto, key_prefix: str = ""):
+    name       = p.get("name", "")
     author_url = p.get("website") if p.get("_source") == "openalex" else None
-    with st.spinner(f"Fetching co-authors for {name} from OpenAlex…"):
+
+    with st.spinner(f"Loading co-authors for {name}…"):
         resolved_inst = None
         if not author_url:
             author_url, _rn, resolved_inst = resolve_author_id(name, mailto)
         if not author_url:
-            st.info(f"No OpenAlex profile found for **{name}**, so co-authors aren't available.")
+            st.info(f"No OpenAlex profile found for **{name}**.")
             return
         coauthors, nworks, err = fetch_coauthors(author_url, mailto)
+
     if err:
-        st.warning(f"Couldn't load co-authors: {err}")
+        st.warning(f"⚠️ {err}")
         return
     if not coauthors:
         st.info("No co-authors found on OpenAlex for this author.")
         return
     if resolved_inst:
-        st.caption(f"Matched OpenAlex profile: {name} — {resolved_inst}")
-    st.markdown(f"**🔗 Top {len(coauthors)} co-authors** (aggregated from {nworks} most-cited works on OpenAlex):")
+        st.caption(f"OpenAlex match: **{name}** — {resolved_inst}")
+
+    st.markdown(
+        f"**🔗 Top {len(coauthors)} co-authors** "
+        f"(from {nworks} most-cited works · ranked by joint-work count, tie-broken by joint citations):"
+    )
     ca_df = pd.DataFrame([{
-        "Co-author": c["name"],
-        "Institution": c["institution"] or "—",
-        "Joint works": c["joint_works"],
+        "Co-author":       c["name"],
+        "Institution":     c["institution"] or "—",
+        "Joint works":     c["joint_works"],
         "Joint citations": c["joint_citations"],
-        "OpenAlex": c["openalex"],
+        "OpenAlex":        c["openalex"],
     } for c in coauthors])
-    st.dataframe(ca_df, use_container_width=True, hide_index=True,
-                 column_config={"OpenAlex": st.column_config.LinkColumn("OpenAlex", display_text="profile ↗")})
+    st.dataframe(
+        ca_df, use_container_width=True, hide_index=True,
+        column_config={"OpenAlex": st.column_config.LinkColumn("OpenAlex", display_text="profile ↗")},
+    )
     chart_df = ca_df.head(10).sort_values("Joint works")
-    fig = px.bar(chart_df, x="Joint works", y="Co-author", orientation="h",
-                 template="plotly_dark", color="Joint works", color_continuous_scale="Tealgrn",
-                 labels={"Joint works": "Number of joint works"})
+    fig = px.bar(
+        chart_df, x="Joint works", y="Co-author", orientation="h",
+        template="plotly_dark", color="Joint works", color_continuous_scale="Tealgrn",
+        labels={"Joint works": "Joint works"},
+    )
     fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10), coloraxis_showscale=False)
-    st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_coauth_chart_{author_url}")
+    st.plotly_chart(fig, use_container_width=True,
+                    key=f"{key_prefix}_coauth_{(author_url or name)[-12:]}")
 
 # ═══════════════════════════════════════
 # HEADER
