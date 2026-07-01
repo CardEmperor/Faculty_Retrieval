@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import plotly.express as px
 
 # ═══════════════════════════════════════
-# PAGE CONFIG & SESSION STATE
+# PAGE CONFIG
 # ═══════════════════════════════════════
 st.set_page_config(
     page_title="AI & Future of Work — Professor Directory",
@@ -18,20 +18,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
-# Initialize persistent session states for search and selections
-if "extra_profs" not in st.session_state:
-    st.session_state.extra_profs = []
-if "coauthors_show" not in st.session_state:
-    st.session_state.coauthors_show = set()
-if "search_query" not in st.session_state:
-    st.session_state.search_query = None
-if "search_mode" not in st.session_state:
-    st.session_state.search_mode = None
-if "search_n" not in st.session_state:
-    st.session_state.search_n = 5
-if "success_msg" not in st.session_state:
-    st.session_state.success_msg = None
 
 # ═══════════════════════════════════════
 # LOAD SEED DATA
@@ -43,6 +29,13 @@ def load_data():
         return json.load(f)
 
 seed_profs = load_data()
+
+if "extra_profs" not in st.session_state:
+    st.session_state.extra_profs = []
+
+if "coauthors_show" not in st.session_state:
+    st.session_state.coauthors_show = set()
+
 profs = seed_profs + st.session_state.extra_profs
 df = pd.DataFrame(profs)
 
@@ -64,22 +57,49 @@ st.markdown("""
 # ═══════════════════════════════════════
 OPENALEX_BASE = "https://api.openalex.org"
 
+# ── One shared session: connection-pooled + automatic retries with backoff ──
+#   5 retries with jittered exponential backoff (≈1, 2, 4, 8, 16 s + jitter),
+#   honoring any Retry-After header OpenAlex sends. Retried for all transient
+#   errors, including 503 (server overloaded / load-shedding), which is the
+#   most common failure mode when many apps share a cloud platform's egress IPs.
 def _make_session() -> requests.Session:
     session = requests.Session()
     retry = Retry(
-        total=3,
-        backoff_factor=1,
+        total=5,
+        backoff_factor=1,                 # 1, 2, 4, 8, 16 s between attempts
+        backoff_jitter=0.5,                # + up to 0.5 s random jitter, avoids thundering herd
         status_forcelist={408, 429, 500, 502, 503, 504},
         allowed_methods={"GET"},
+        respect_retry_after_header=True,   # if OpenAlex says "wait N s", honor it exactly
         raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=10)
     session.mount("https://", adapter)
     session.mount("http://",  adapter)
+    # A descriptive User-Agent is OpenAlex's other recommended way (besides mailto)
+    # to identify polite, well-behaved traffic instead of anonymous/common-pool requests.
+    session.headers.update({
+        "User-Agent": "FacultyRetrievalApp/1.0 (Streamlit; +https://facultyretrieval.streamlit.app)"
+    })
     return session
 
+# Module-level singleton — reused across Streamlit reruns via the module cache.
 _SESSION = _make_session()
+
+# Short individual timeout: (connect_timeout, read_timeout).
+# The adapter retries up to 5× if this fires; typical success is well under 20 s,
+# worst case (all 5 retries needed) is a couple of minutes, which is rare.
 _TIMEOUT = (5, 8)
+
+# ── Stale-but-usable fallback cache ──
+# If a request ultimately fails after all retries, we serve the last successful
+# response for that exact URL+params (if we have one) rather than a hard error.
+# This turns "OpenAlex had a bad 30 seconds" into "you see slightly-stale data
+# with a warning" instead of a broken page.
+_LAST_GOOD: dict[str, dict] = {}
+
+def _cache_key(url, params):
+    return url + "?" + "&".join(f"{k}={v}" for k, v in sorted((params or {}).items()))
 
 COUNTRY_NAMES = {
     "US":"United States","GB":"United Kingdom","CA":"Canada","DE":"Germany","FR":"France",
@@ -105,18 +125,47 @@ def _params(extra: dict, mailto: str | None) -> dict:
     return p
 
 def _get(url, params, label="OpenAlex"):
+    """
+    Thin GET wrapper with automatic retry (via the session adapter) and a
+    stale-cache fallback: if every retry still fails, and we have a previously
+    successful response for this exact request, serve that instead of erroring.
+    Returns (json_or_None, error_message_or_None, is_stale: bool).
+    """
+    key = _cache_key(url, params)
     try:
         r = _SESSION.get(url, params=params, timeout=_TIMEOUT)
         r.raise_for_status()
-        return r.json(), None
+        data = r.json()
+        _LAST_GOOD[key] = data     # remember the last good response for this query
+        return data, None, False
     except requests.exceptions.Timeout:
-        return None, f"{label}: timed out after 3 retries — OpenAlex may be slow right now."
-    except requests.exceptions.ConnectionError as e:
-        return None, f"{label}: connection error — {e}"
+        if key in _LAST_GOOD:
+            return _LAST_GOOD[key], None, True
+        return None, (f"{label}: timed out even after retries — OpenAlex may be slow right now. "
+                      f"Try again in a moment."), False
     except requests.exceptions.HTTPError as e:
-        return None, f"{label}: HTTP {e.response.status_code}"
+        code = e.response.status_code if e.response is not None else "?"
+        if key in _LAST_GOOD:
+            return _LAST_GOOD[key], None, True
+        if code == 503:
+            msg = (f"{label}: OpenAlex returned 503 (temporarily overloaded) and retries were "
+                  f"exhausted. This is on OpenAlex's side, not your query — it usually clears "
+                  f"within a minute or two. Try again shortly.")
+        elif code == 429:
+            msg = f"{label}: rate-limited (429) after retries. Adding your email in the sidebar helps avoid this."
+        else:
+            msg = f"{label}: HTTP {code}"
+        return None, msg, False
+    except requests.exceptions.ConnectionError as e:
+        if key in _LAST_GOOD:
+            return _LAST_GOOD[key], None, True
+        return None, f"{label}: connection error — {e}", False
     except Exception as e:
-        return None, f"{label}: {e}"
+        if key in _LAST_GOOD:
+            return _LAST_GOOD[key], None, True
+        return None, f"{label}: {e}", False
+
+# ── Schema helpers ──
 
 def _author_core(a: dict) -> dict:
     inst, country = "", ""
@@ -147,7 +196,7 @@ def _author_core(a: dict) -> dict:
         "top_cited":    [],
         "linkedin":     "",
         "twitter":      "",
-        "website":      a.get("id", ""),   # canonical URL
+        "website":      a.get("id", ""),   # OpenAlex canonical URL
         "scholar":      orcid,
         "email":        "",
         "ra_hiring":    None,
@@ -158,9 +207,10 @@ def _author_core(a: dict) -> dict:
         "_source":      "openalex",
     }
 
+# ── Top-works fetch (lean payload) ──
 @st.cache_data(ttl=21600, show_spinner=False)
 def fetch_top_works(author_id: str, mailto=None, n=3) -> list[str]:
-    data, err = _get(f"{OPENALEX_BASE}/works",
+    data, err, _stale = _get(f"{OPENALEX_BASE}/works",
                      _params({"filter": f"author.id:{author_id}",
                               "sort": "cited_by_count:desc",
                               "per-page": n,
@@ -184,116 +234,191 @@ def _author_to_prof(a: dict, mailto=None) -> dict:
         core["top_cited"] = fetch_top_works(aid, mailto)
     return core
 
+# Cap thread-pool concurrency at 3: fewer simultaneous requests are gentler on
+# an endpoint that's already load-shedding (503s), and less likely to trip
+# additional rate limits than firing 5+ requests at once.
+_MAX_WORKERS = 3
+
+# ── Author search by name ──
 @st.cache_data(ttl=21600, show_spinner=False)
-def search_by_name(name: str, n: int, mailto=None) -> tuple[list, str | None]:
-    data, err = _get(f"{OPENALEX_BASE}/authors",
+def search_by_name(name: str, n: int, mailto=None) -> tuple[list, str | None, bool]:
+    data, err, stale = _get(f"{OPENALEX_BASE}/authors",
                      _params({"search": name, "per-page": n}, mailto))
     if err:
-        return [], err
+        return [], err, False
     authors = data.get("results", []) if data else []
+    # Fetch top works in parallel (bounded pool)
     results = []
-    with ThreadPoolExecutor(max_workers=min(n, 5)) as ex:
+    with ThreadPoolExecutor(max_workers=min(n, _MAX_WORKERS)) as ex:
         futs = {ex.submit(_author_to_prof, a, mailto): a for a in authors}
         for fut in as_completed(futs):
-            try: results.append(fut.result())
-            except Exception: pass
+            try:
+                results.append(fut.result())
+            except Exception:
+                pass
     results.sort(key=lambda p: p.get("citations", 0), reverse=True)
-    return results, None
+    return results, None, stale
 
+# ── Author search by field (lean: request only authorships + citations) ──
 @st.cache_data(ttl=21600, show_spinner=False)
-def search_by_field(topic: str, n: int, mailto=None) -> tuple[list, str | None]:
-    data, err = _get(f"{OPENALEX_BASE}/works",
-                     _params({"search": topic, "sort": "cited_by_count:desc",
-                              "per-page": 50, "select": "cited_by_count,authorships"}, mailto))
+def search_by_field(topic: str, n: int, mailto=None) -> tuple[list, str | None, bool]:
+    data, err, stale = _get(f"{OPENALEX_BASE}/works",
+                     _params({"search": topic,
+                              "sort":   "cited_by_count:desc",
+                              "per-page": 50,
+                              "select": "cited_by_count,authorships"},
+                             mailto))
     if err:
-        return [], err
-    seen = {}
+        return [], err, False
+    # Collect unique author IDs in citation-weighted order
+    seen: dict[str, str] = {}  # id → display_name
     for w in (data or {}).get("results", []):
         for au in w.get("authorships", []):
             aobj = au.get("author") or {}
-            aid = aobj.get("id")
+            aid  = aobj.get("id")
             if aid and aid not in seen:
                 seen[aid] = aobj.get("display_name", "")
-            if len(seen) >= n * 4: break
+            if len(seen) >= n * 4:
+                break
 
+    # Fetch full author records in parallel (bounded pool)
     def _fetch_one(aid):
-        d, e = _get(f"{OPENALEX_BASE}/authors/{aid.split('/')[-1]}", _params({}, mailto))
-        if e or not d: return None
+        d, e, _s = _get(f"{OPENALEX_BASE}/authors/{aid.split('/')[-1]}",
+                    _params({}, mailto), label=f"author {aid[-8:]}")
+        if e or not d:
+            return None
         return _author_to_prof(d, mailto)
 
     out = []
-    with ThreadPoolExecutor(max_workers=min(n, 5)) as ex:
+    with ThreadPoolExecutor(max_workers=min(n, _MAX_WORKERS)) as ex:
         futs = {ex.submit(_fetch_one, aid): aid for aid in list(seen)[:n * 2]}
         for fut in as_completed(futs):
             try:
                 p = fut.result()
-                if p: out.append(p)
-            except Exception: pass
-            if len(out) >= n: break
+                if p:
+                    out.append(p)
+            except Exception:
+                pass
+            if len(out) >= n:
+                break
+
     out.sort(key=lambda p: p.get("citations", 0), reverse=True)
-    return out[:n], None
+    return out[:n], None, stale
 
 def run_search(mode, query, n, mailto):
-    if mode == "Research field / topic": return search_by_field(query, n, mailto)
+    if mode == "Research field / topic":
+        return search_by_field(query, n, mailto)
     return search_by_name(query, n, mailto)
 
+# ── Co-author resolution & fetch ──
 @st.cache_data(ttl=21600, show_spinner=False)
 def resolve_author_id(name: str, mailto=None) -> tuple[str | None, str | None, str | None]:
-    data, err = _get(f"{OPENALEX_BASE}/authors",
+    """Resolve a professor name → (openalex_url, display_name, institution)."""
+    data, err, _stale = _get(f"{OPENALEX_BASE}/authors",
                      _params({"search": name, "per-page": 1,
-                              "select": "id,display_name,last_known_institutions"}, mailto))
-    if err or not data: return None, None, None
+                              "select": "id,display_name,last_known_institutions"},
+                             mailto))
+    if err or not data:
+        return None, None, None
     results = data.get("results", [])
-    if not results: return None, None, None
-    a = results[0]
+    if not results:
+        return None, None, None
+    a    = results[0]
     inst = ""
-    lki = a.get("last_known_institutions") or []
-    if lki and isinstance(lki[0], dict): inst = lki[0].get("display_name", "") or ""
+    lki  = a.get("last_known_institutions") or []
+    if lki and isinstance(lki[0], dict):
+        inst = lki[0].get("display_name", "") or ""
     return a.get("id"), a.get("display_name"), inst
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def fetch_coauthors(author_url: str, mailto=None, top_n: int = 15, max_works: int = 100) -> tuple[list, int, str | None]:
-    if not author_url: return [], 0, "No OpenAlex author id."
-    aid = author_url.split("/")[-1]
-    counts, cocites, info = {}, {}, {}
+def fetch_coauthors(
+    author_url: str,
+    mailto=None,
+    top_n: int = 15,
+    max_works: int = 100,
+) -> tuple[list, int, str | None, bool]:
+    """
+    Aggregate co-authors from the author's most-cited works.
+
+    Strategy
+    --------
+    • Fetch works in pages of 50 (not one huge 200-row request).
+    • Use select= to pull only the three fields we need, cutting payload ~80 %.
+    • Stop as soon as we have max_works worth of results.
+    • All HTTP calls go through the retry session (_get), so transient 5xx /
+      timeouts are retried automatically with back-off before surfacing an error.
+    • If a page ultimately fails, we still use whatever pages succeeded rather
+      than discarding everything.
+
+    Returns (coauthors, n_works_scanned, error_or_None, any_page_was_stale).
+    """
+    if not author_url:
+        return [], 0, "No OpenAlex author id.", False
+    aid       = author_url.split("/")[-1]
+    counts: dict[str, int]  = {}
+    cocites: dict[str, int] = {}
+    info:   dict[str, dict] = {}
     total_fetched = 0
+    any_stale = False
     PAGE_SIZE = 50
 
     for page in range(1, (max_works // PAGE_SIZE) + 2):
-        if total_fetched >= max_works: break
-        data, err = _get(f"{OPENALEX_BASE}/works",
-                         _params({"filter": f"author.id:{aid}", "sort": "cited_by_count:desc",
-                                  "per-page": PAGE_SIZE, "page": page,
-                                  "select": "cited_by_count,authorships"}, mailto))
-        if err:
-            if total_fetched == 0: return [], 0, err
+        if total_fetched >= max_works:
             break
+        data, err, stale = _get(
+            f"{OPENALEX_BASE}/works",
+            _params({"filter":   f"author.id:{aid}",
+                     "sort":     "cited_by_count:desc",
+                     "per-page": PAGE_SIZE,
+                     "page":     page,
+                     "select":   "cited_by_count,authorships"},
+                    mailto),
+            label=f"works p{page}",
+        )
+        any_stale = any_stale or stale
+        if err:
+            if total_fetched == 0:
+                return [], 0, err, False   # nothing yet — propagate the error
+            break                          # got some pages already — use them
         results = (data or {}).get("results", [])
-        if not results: break
+        if not results:
+            break
         for w in results:
             wc = w.get("cited_by_count", 0) or 0
             for au in w.get("authorships", []):
                 aobj = au.get("author") or {}
-                cid = aobj.get("id")
-                if not cid or cid == author_url: continue
-                counts[cid] = counts.get(cid, 0) + 1
+                cid  = aobj.get("id")
+                if not cid or cid == author_url:
+                    continue
+                counts[cid]  = counts.get(cid, 0) + 1
                 cocites[cid] = cocites.get(cid, 0) + wc
                 if cid not in info:
                     insts = au.get("institutions") or []
-                    iname = insts[0].get("display_name", "") if insts and isinstance(insts[0], dict) else ""
+                    iname = (insts[0].get("display_name", "")
+                             if insts and isinstance(insts[0], dict) else "")
                     info[cid] = {"name": aobj.get("display_name", ""), "institution": iname}
         total_fetched += len(results)
-        if len(results) < PAGE_SIZE: break
-        time.sleep(0.1)
+        # If the page was smaller than PAGE_SIZE, there are no more pages
+        if len(results) < PAGE_SIZE:
+            break
+        time.sleep(0.1)  # be a polite client between pages
 
-    ranked = sorted(counts.items(), key=lambda x: (x[1], cocites.get(x[0], 0)), reverse=True)[:top_n]
-    coauthors = [{"name": info[cid]["name"], "institution": info[cid]["institution"],
-                  "joint_works": cnt, "joint_citations": cocites.get(cid, 0), "openalex": cid} 
-                 for cid, cnt in ranked]
-    return coauthors, total_fetched, None
+    ranked = sorted(counts.items(),
+                    key=lambda x: (x[1], cocites.get(x[0], 0)),
+                    reverse=True)[:top_n]
+    coauthors = [{
+        "name":            info[cid]["name"],
+        "institution":     info[cid]["institution"],
+        "joint_works":     cnt,
+        "joint_citations": cocites.get(cid, 0),
+        "openalex":        cid,
+    } for cid, cnt in ranked]
+    return coauthors, total_fetched, None, any_stale
 
 def render_coauthors(p: dict, mailto, key_prefix: str = ""):
-    name, author_url = p.get("name", ""), p.get("website") if p.get("_source") == "openalex" else None
+    name       = p.get("name", "")
+    author_url = p.get("website") if p.get("_source") == "openalex" else None
+
     with st.spinner(f"Loading co-authors for {name}…"):
         resolved_inst = None
         if not author_url:
@@ -301,28 +426,47 @@ def render_coauthors(p: dict, mailto, key_prefix: str = ""):
         if not author_url:
             st.info(f"No OpenAlex profile found for **{name}**.")
             return
-        coauthors, nworks, err = fetch_coauthors(author_url, mailto)
+        coauthors, nworks, err, stale = fetch_coauthors(author_url, mailto)
 
     if err:
         st.warning(f"⚠️ {err}")
+        if st.button("🔄 Retry", key=f"{key_prefix}_retry_coauth_{(author_url or name)[-12:]}"):
+            fetch_coauthors.clear()
+            st.rerun()
         return
+    if stale:
+        st.caption("⏱️ OpenAlex was slow to respond just now — showing the most recent successful "
+                   "result for this professor instead of failing outright.")
     if not coauthors:
         st.info("No co-authors found on OpenAlex for this author.")
         return
     if resolved_inst:
         st.caption(f"OpenAlex match: **{name}** — {resolved_inst}")
 
-    st.markdown(f"**🔗 Top {len(coauthors)} co-authors** (from {nworks} most-cited works)")
-    ca_df = pd.DataFrame([{"Co-author": c["name"], "Institution": c["institution"] or "—",
-                           "Joint works": c["joint_works"], "Joint citations": c["joint_citations"],
-                           "OpenAlex": c["openalex"]} for c in coauthors])
-    st.dataframe(ca_df, use_container_width=True, hide_index=True,
-                 column_config={"OpenAlex": st.column_config.LinkColumn("OpenAlex", display_text="profile ↗")})
+    st.markdown(
+        f"**🔗 Top {len(coauthors)} co-authors** "
+        f"(from {nworks} most-cited works · ranked by joint-work count, tie-broken by joint citations):"
+    )
+    ca_df = pd.DataFrame([{
+        "Co-author":       c["name"],
+        "Institution":     c["institution"] or "—",
+        "Joint works":     c["joint_works"],
+        "Joint citations": c["joint_citations"],
+        "OpenAlex":        c["openalex"],
+    } for c in coauthors])
+    st.dataframe(
+        ca_df, use_container_width=True, hide_index=True,
+        column_config={"OpenAlex": st.column_config.LinkColumn("OpenAlex", display_text="profile ↗")},
+    )
     chart_df = ca_df.head(10).sort_values("Joint works")
-    fig = px.bar(chart_df, x="Joint works", y="Co-author", orientation="h", template="plotly_dark",
-                 color="Joint works", color_continuous_scale="Tealgrn")
+    fig = px.bar(
+        chart_df, x="Joint works", y="Co-author", orientation="h",
+        template="plotly_dark", color="Joint works", color_continuous_scale="Tealgrn",
+        labels={"Joint works": "Joint works"},
+    )
     fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10), coloraxis_showscale=False)
-    st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_coauth_{(author_url or name)[-12:]}")
+    st.plotly_chart(fig, use_container_width=True,
+                    key=f"{key_prefix}_coauth_{(author_url or name)[-12:]}")
 
 # ═══════════════════════════════════════
 # HEADER
@@ -330,7 +474,8 @@ def render_coauthors(p: dict, mailto, key_prefix: str = ""):
 st.title("🤖 AI & Future of Work — Professor Directory")
 n_found = len(st.session_state.extra_profs)
 subtitle = f"**{len(seed_profs)} seeded professors**"
-if n_found: subtitle += f" + **{n_found} found via search**"
+if n_found:
+    subtitle += f" + **{n_found} found via search**"
 subtitle += " researching AI, Automation, FinTech & the Future of Work"
 st.markdown(subtitle)
 st.markdown("---")
@@ -354,9 +499,18 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("🔎 Live Search (free)")
-    st.text_input("Your email (optional)", key="openalex_mailto",
-                  help="Optional. OpenAlex gives faster responses when you identify yourself.")
+    st.caption("Powered by OpenAlex — no API key or payment needed.")
+    st.text_input("Your email (recommended)", key="openalex_mailto",
+                  help="OpenAlex routes requests with an email into their faster, more reliable "
+                       "'polite pool' instead of the shared anonymous pool — this meaningfully "
+                       "reduces 503 'overloaded' errors, especially on shared hosting like "
+                       "Streamlit Cloud where many apps' traffic shares the same IPs.")
+    if not st.session_state.get("openalex_mailto"):
+        st.caption("⚠️ Adding your email above is the single biggest thing you can do to avoid 503 errors.")
 
+# ═══════════════════════════════════════
+# FILTERS
+# ═══════════════════════════════════════
 def apply_filters(plist):
     out = plist.copy()
     if search:
@@ -375,7 +529,8 @@ def apply_filters(plist):
 
     def social_ok(p):
         sc = p.get("social_score")
-        if sc is None: return social_range == (0, 100)
+        if sc is None:
+            return social_range == (0, 100)   # unknown passes only when range isn't narrowed
         return social_range[0] <= sc <= social_range[1]
     out = [p for p in out if social_ok(p)]
 
@@ -416,28 +571,37 @@ def render_professor(p, found=False):
             st.markdown(f"**Department:** {p.get('department','') or '—'}")
             st.markdown(f"**Country:** {p.get('country','') or '—'}")
             st.markdown(f"**Research Areas:** {', '.join(p.get('areas', []))}")
-            if p.get("seeks"): st.markdown(f"**What They Seek:** {p['seeks']}")
-            if p.get("phd_students"): st.markdown(f"**Students/Lab:** {p['phd_students']}")
-            if p.get("awards"): st.markdown(f"🏆 **Awards:** {p['awards']}")
-            if p.get("_source") == "openalex": st.caption("Source: OpenAlex (live). Social score unavailable from free academic data.")
+            if p.get("seeks"):
+                st.markdown(f"**What They Seek:** {p['seeks']}")
+            if p.get("phd_students"):
+                st.markdown(f"**Students/Lab:** {p['phd_students']}")
+            if p.get("awards"):
+                st.markdown(f"🏆 **Awards:** {p['awards']}")
+            if p.get("_source") == "openalex":
+                st.caption("Source: OpenAlex (live). Social score unavailable from free academic data.")
         with col2:
             st.metric("Impact Score", p.get("impact_score", "?"))
             st.metric("h-index", p.get("h_index", "?"))
-            st.metric("Citations", f"{p.get('citations', 0):,}")
+            cites = p.get("citations", 0)
+            st.metric("Citations", f"{cites:,}" if isinstance(cites, int) else cites)
             st.metric("Social Score", soc_disp)
             ra = p.get("ra_hiring")
-            st.markdown(f"**Hiring RAs:** {'✅ Yes' if ra else ('❓ Unknown' if ra is None else '❌ No')}")
+            ra_status = "✅ Yes" if ra else ("❓ Unknown" if ra is None else "❌ No")
+            st.markdown(f"**Hiring RAs:** {ra_status}")
         if p.get("top_cited"):
             st.markdown("**📝 Most Cited Works:**")
-            for paper in p["top_cited"]: st.markdown(f"- {paper}")
+            for paper in p["top_cited"]:
+                st.markdown(f"- {paper}")
         links = []
         if p.get("email"): links.append(f"📧 [{p['email']}](mailto:{p['email']})")
         if p.get("website"): links.append(f"🌐 [Profile/Website]({p['website']})")
         if p.get("scholar"): links.append(f"🎓 [Scholar/ORCID]({p['scholar']})")
         if p.get("twitter"): links.append(f"🐦 {p['twitter']}")
         if p.get("linkedin"): links.append(f"💼 {p['linkedin']}")
-        if links: st.markdown(" | ".join(links))
+        if links:
+            st.markdown(" | ".join(links))
 
+        # Co-author lookup (live from OpenAlex)
         st.markdown("---")
         ckey = p.get("website") or p.get("name", "")
         mailto_local = st.session_state.get("openalex_mailto", "") or None
@@ -453,71 +617,71 @@ def render_professor(p, found=False):
 
 # ── TAB 1 ──
 with tab1:
-    if not filtered: st.info("No professors match your filters.")
-    for p in filtered: render_professor(p, found=(p in st.session_state.extra_profs))
+    if not filtered:
+        st.info("No professors match your filters. Try widening them, or use **Find New Professors** to search the web.")
+    for p in filtered:
+        render_professor(p, found=(p in st.session_state.extra_profs))
 
 # ── TAB 2: FIND NEW PROFESSORS (OpenAlex) ──
 with tab2:
-    if st.session_state.success_msg:
-        st.success(st.session_state.success_msg)
-        st.session_state.success_msg = None
-
     st.subheader("🔎 Find Professors Beyond the Database — Free, No API Key")
-    st.markdown("Searches **OpenAlex** (240M+ works). Found professors are added to every tab for this session.")
-    
+    st.markdown("Searches **OpenAlex**, an open catalog of 240M+ scholarly works. Returns real citation "
+                "counts, h-index, institutions, and most-cited works. Found professors are added to every "
+                "tab for this session. **Searching by professor name also shows their top co-authors.**")
+    st.info("ℹ️ OpenAlex provides academic metrics only. **Social activeness scores aren't available** "
+            "from free data, so searched professors show *Social: N/A*. Impact, h-index, citations and "
+            "works are all real.")
+
     mailto = st.session_state.get("openalex_mailto", "") or None
+
     mode = st.radio("Search by", ["Research field / topic", "Professor name"], horizontal=True)
     colq, coln = st.columns([4, 1])
     with colq:
-        query = st.text_input("Search query" if mode == "Professor name" else "Topic / field", 
-                              placeholder="e.g. 'Daniel Kahneman'" if mode == "Professor name" else "e.g. 'artificial intelligence labor'")
+        if mode == "Research field / topic":
+            query = st.text_input("Topic / field",
+                                   placeholder="e.g. 'artificial intelligence labor economics' or 'fintech credit'")
+        else:
+            query = st.text_input("Professor name", placeholder="e.g. 'Daniel Kahneman'")
     with coln:
         n_results = st.number_input("# results", min_value=1, max_value=10, value=5)
 
     st.caption("Quick field searches:")
-    suggestions = ["artificial intelligence automation labor", "generative AI productivity", "machine learning asset pricing"]
+    suggestions = [
+        "artificial intelligence automation labor",
+        "generative AI productivity",
+        "machine learning asset pricing",
+        "fintech financial inclusion",
+        "future of work economics",
+    ]
     scols = st.columns(len(suggestions))
     clicked = None
     for i, s in enumerate(suggestions):
-        if scols[i].button(s, key=f"sugg_{i}"): clicked = s
+        if scols[i].button(s, key=f"sugg_{i}"):
+            clicked = s
 
     do_search = st.button("🔍 Search OpenAlex", type="primary")
-
-    # Update persistent state when search is triggered
-    if do_search:
-        st.session_state.search_query = query
-        st.session_state.search_mode = mode
-        st.session_state.search_n = int(n_results)
-    elif clicked:
-        st.session_state.search_query = clicked
-        st.session_state.search_mode = "Research field / topic"
-        st.session_state.search_n = int(n_results)
-
-    active_query = st.session_state.search_query
-    active_mode = st.session_state.search_mode
-    active_n = st.session_state.search_n
+    active_query = clicked or (query if do_search else None)
+    active_mode = "Research field / topic" if clicked else mode
 
     if active_query:
-        st.markdown("---")
-        cc_a, cc_b = st.columns([4, 1])
-        cc_a.markdown(f"**Current Search:** `{active_query}` ({active_mode})")
-        if cc_b.button("❌ Clear Results"):
-            st.session_state.search_query = None
-            st.rerun()
-
         with st.spinner(f"Searching OpenAlex for: {active_query} ..."):
-            results, err = run_search(active_mode, active_query, active_n, mailto)
-            
+            results, err, stale = run_search(active_mode, active_query, int(n_results), mailto)
         if err:
-            st.error(err)
+            st.error(f"⚠️ {err}")
+            if st.button("🔄 Retry search"):
+                search_by_name.clear()
+                search_by_field.clear()
+                st.rerun()
         elif not results:
-            st.warning("No researchers found. Try different keywords.")
+            st.warning("No researchers found. Try different keywords or the other search mode.")
         else:
+            if stale:
+                st.caption("⏱️ OpenAlex was briefly overloaded — showing the last successful result "
+                           "for this exact query instead of failing.")
             existing = {p["name"].lower() for p in profs}
             new_results = [r for r in results if r.get("name", "").lower() not in existing]
-            
             if not new_results:
-                st.warning("All matches from this search are already in your directory.")
+                st.warning("All matches are already in your directory. Try a different query.")
             else:
                 st.success(f"Found {len(new_results)} researcher(s). Review and click **Add** to include them.")
                 for idx, r in enumerate(new_results):
@@ -528,16 +692,19 @@ with tab2:
                         st.markdown(f"**Areas:** {', '.join(r.get('areas', []))}")
                         if r.get("top_cited"):
                             st.markdown("**Top works:**")
-                            for w in r["top_cited"]: st.markdown(f"- {w}")
+                            for w in r["top_cited"]:
+                                st.markdown(f"- {w}")
                         links = []
                         if r.get("website"): links.append(f"[OpenAlex profile]({r['website']})")
                         if r.get("scholar"): links.append(f"[ORCID]({r['scholar']})")
-                        if links: st.markdown(" | ".join(links))
+                        if links:
+                            st.markdown(" | ".join(links))
                     with cc2:
                         st.metric("Impact (est.)", r.get("impact_score", "?"))
                         st.metric("h-index", r.get("h_index", "?"))
                         st.metric("Citations", f"{r.get('citations',0):,}")
-
+                        st.caption("Social: N/A")
+                    # Co-authors: shown automatically for name searches, on-demand for field searches
                     mailto_res = st.session_state.get("openalex_mailto", "") or None
                     if active_mode == "Professor name":
                         with st.expander(f"🔗 Top co-authors of {r.get('name','')}", expanded=True):
@@ -546,27 +713,26 @@ with tab2:
                         rk = r.get("website") or r.get("name", "")
                         if rk in st.session_state.coauthors_show:
                             render_coauthors(r, mailto_res, key_prefix=f"search{idx}")
-                            if st.button("Hide co-authors", key=f"sc_hide_{idx}_{rk}"):
-                                st.session_state.coauthors_show.discard(rk)
-                                st.rerun()
                         elif st.button(f"🔗 Show co-authors of {r.get('name','')}", key=f"sc_show_{idx}_{rk}"):
                             st.session_state.coauthors_show.add(rk)
                             st.rerun()
-                            
                     if st.button(f"➕ Add {r.get('name','')}", key=f"add_{idx}_{r.get('name','')}"):
                         st.session_state.extra_profs.append(r)
-                        st.session_state.success_msg = f"Added {r.get('name','')}!"
+                        st.success(f"Added {r.get('name','')}!")
                         st.rerun()
 
                 if len(new_results) > 1 and st.button("➕➕ Add ALL", key="add_all"):
-                    for r in new_results: st.session_state.extra_profs.append(r)
-                    st.session_state.success_msg = f"Added {len(new_results)} researcher(s)!"
+                    have = {p["name"].lower() for p in (seed_profs + st.session_state.extra_profs)}
+                    for r in new_results:
+                        if r.get("name", "").lower() not in have:
+                            st.session_state.extra_profs.append(r)
+                    st.success(f"Added {len(new_results)} researcher(s)!")
                     st.rerun()
 
     if st.session_state.extra_profs:
         st.markdown("---")
-        st.markdown(f"**🟢 {len(st.session_state.extra_profs)} added via search this session:** " + 
-                    ", ".join(p["name"] for p in st.session_state.extra_profs))
+        st.markdown(f"**🟢 {len(st.session_state.extra_profs)} added via search this session:** "
+                    + ", ".join(p["name"] for p in st.session_state.extra_profs))
         if st.button("🗑️ Clear all found professors"):
             st.session_state.extra_profs = []
             st.rerun()
@@ -583,27 +749,44 @@ with tab3:
         scatter_df = scatter_df.dropna(subset=["social_score"])
         if len(scatter_df):
             fig = px.scatter(scatter_df, x="social_score", y="impact_score", size="h_index",
-                             color="source", symbol="source", hover_name="name", hover_data=["university", "h_index"],
-                             labels={"social_score": "Social Score", "impact_score": "Impact Score"},
+                             color="source", symbol="source", hover_name="name",
+                             hover_data=["university", "h_index", "citations"],
+                             labels={"social_score": "Social Activeness Score", "impact_score": "Academic Impact Score"},
                              size_max=45, template="plotly_dark",
                              color_discrete_map={"Seeded": "#4A90D9", "Found via Search": "#2ECC71"})
             fig.update_layout(height=500)
             st.plotly_chart(fig, use_container_width=True)
-        if dropped: st.caption(f"Note: {dropped} searched professor(s) omitted from scatter (social scores unavailable).")
+        if dropped:
+            st.caption(f"Note: {dropped} searched professor(s) omitted from this chart — social scores aren't "
+                       "available from OpenAlex. They still appear in the impact chart and all other tabs.")
 
         st.subheader("Top 15 by Impact Score")
         top15 = fig_df.nlargest(15, "impact_score")
-        fig2 = px.bar(top15, x="name", y="impact_score", color="impact_score", color_continuous_scale="Reds", template="plotly_dark")
+        fig2 = px.bar(top15, x="name", y="impact_score", color="impact_score",
+                      color_continuous_scale="Reds", template="plotly_dark",
+                      labels={"impact_score": "Impact Score", "name": "Professor"})
         fig2.update_layout(height=400, xaxis_tickangle=-45)
         st.plotly_chart(fig2, use_container_width=True)
+
+        seeded_social = fig_df[fig_df["source"] == "Seeded"]
+        if len(seeded_social):
+            st.subheader("Top 15 by Social Activeness (seeded professors)")
+            top15s = seeded_social.nlargest(15, "social_score")
+            fig3 = px.bar(top15s, x="name", y="social_score", color="social_score",
+                          color_continuous_scale="Blues", template="plotly_dark",
+                          labels={"social_score": "Social Score", "name": "Professor"})
+            fig3.update_layout(height=400, xaxis_tickangle=-45)
+            st.plotly_chart(fig3, use_container_width=True)
 
         st.subheader("Research Areas Distribution")
         area_counts = {}
         for p in filtered:
-            for a in p.get("areas", []): area_counts[a] = area_counts.get(a, 0) + 1
+            for a in p.get("areas", []):
+                area_counts[a] = area_counts.get(a, 0) + 1
         if area_counts:
             area_df = pd.DataFrame(sorted(area_counts.items(), key=lambda x: x[1], reverse=True)[:20], columns=["Area", "Count"])
-            fig4 = px.bar(area_df, x="Count", y="Area", orientation="h", template="plotly_dark", color="Count", color_continuous_scale="Viridis")
+            fig4 = px.bar(area_df, x="Count", y="Area", orientation="h", template="plotly_dark",
+                          color="Count", color_continuous_scale="Viridis")
             fig4.update_layout(height=500, yaxis=dict(autorange="reversed"))
             st.plotly_chart(fig4, use_container_width=True)
     else:
@@ -612,22 +795,56 @@ with tab3:
 # ── TAB 4: TOP CITED ──
 with tab4:
     st.subheader("Most Cited Works")
-    works = [{"Professor": p["name"], "University": p.get("university", ""), "Work": paper, "Impact": p.get("impact_score", 0)}
-             for p in filtered for paper in p.get("top_cited", [])[:3]]
+    works = []
+    for p in filtered:
+        for paper in p.get("top_cited", [])[:3]:
+            works.append({"Professor": p["name"], "University": p.get("university", ""),
+                          "Work": paper, "Impact": p.get("impact_score", 0), "h-index": p.get("h_index", 0)})
     works_df = pd.DataFrame(works)
     if len(works_df):
         sw = st.text_input("Search works", "", key="search_works")
-        if sw: works_df = works_df[works_df.apply(lambda r: sw.lower() in str(r["Work"]).lower() or sw.lower() in str(r["Professor"]).lower(), axis=1)]
+        if sw:
+            works_df = works_df[works_df.apply(
+                lambda r: sw.lower() in str(r["Work"]).lower() or sw.lower() in str(r["Professor"]).lower(), axis=1)]
         st.dataframe(works_df, use_container_width=True, height=600)
+    else:
+        st.info("No works to show with current filters.")
 
 # ── TAB 5: DOWNLOAD ──
 with tab5:
     st.subheader("Download Database")
     st.caption("Includes both seeded professors and any found via live search this session.")
     csv_df = pd.DataFrame([{
-        "Name": p.get("name", ""), "University": p.get("university", ""), "Areas": "; ".join(p.get("areas", [])),
+        "Name": p.get("name", ""), "University": p.get("university", ""), "Department": p.get("department", ""),
+        "Title": p.get("title", ""), "Country": p.get("country", ""), "Areas": "; ".join(p.get("areas", [])),
         "h_index": p.get("h_index", 0), "Citations": p.get("citations", 0), "Impact_Score": p.get("impact_score", 0),
-        "Source": "Found via Search" if p in st.session_state.extra_profs else "Seeded"
+        "Social_Score": p.get("social_score") if p.get("social_score") is not None else "N/A",
+        "Hiring_RAs": p.get("ra_hiring", ""), "Email": p.get("email", ""), "Twitter": p.get("twitter", ""),
+        "LinkedIn": p.get("linkedin", ""), "Website": p.get("website", ""), "Scholar": p.get("scholar", ""),
+        "Seeks": p.get("seeks", ""), "Awards": p.get("awards", ""),
+        "Top_Cited": " | ".join(p.get("top_cited", [])[:3]),
+        "Source": "Found via Search (OpenAlex)" if p in st.session_state.extra_profs else "Seeded"
     } for p in profs])
-    st.download_button("📥 Download CSV", csv_df.to_csv(index=False), "ai_professors.csv", "text/csv")
-    st.download_button("📥 Download JSON", json.dumps(profs, indent=2), "ai_professors.json", "application/json")
+    st.download_button("📥 Download CSV (all professors)", csv_df.to_csv(index=False), "ai_professors.csv", "text/csv")
+    st.download_button("📥 Download JSON (all professors)", json.dumps(profs, indent=2), "ai_professors.json", "application/json")
+    if st.session_state.extra_profs:
+        st.download_button("📥 Download ONLY found professors (JSON)",
+                           json.dumps(st.session_state.extra_profs, indent=2), "found_professors.json", "application/json")
+
+    st.markdown("---")
+    st.markdown("### How to Host This App")
+    st.code("""
+# 1. Install dependencies
+pip install -r requirements.txt
+
+# 2. Keep these files together:
+#    app.py, professors_data.json, requirements.txt
+
+# 3. Run locally:
+streamlit run app.py
+
+# 4. Deploy free on Streamlit Community Cloud:
+#    - Push to GitHub
+#    - Go to share.streamlit.io, connect the repo, deploy
+#    No API keys or secrets required - search runs on free OpenAlex.
+    """, language="bash")
